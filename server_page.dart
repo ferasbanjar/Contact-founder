@@ -1,10 +1,13 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_contacts/flutter_contacts.dart';
 import 'api.dart';
+import 'contacts_service.dart';
+import 'login_page.dart';
 
+/// شاشة الحساب والمزامنة.
 class ServerPage extends StatefulWidget {
   final List<Contact> contacts;
-  const ServerPage({super.key, required this.contacts});
+  const ServerPage({super.key, this.contacts = const []});
 
   @override
   State<ServerPage> createState() => _ServerPageState();
@@ -12,10 +15,7 @@ class ServerPage extends StatefulWidget {
 
 class _ServerPageState extends State<ServerPage> {
   final _url = TextEditingController();
-  final _key = TextEditingController();
-  final _q = TextEditingController();
   ServerSettings? _s;
-  List<Map<String, dynamic>> _results = [];
   String _msg = '';
   bool _busy = false;
 
@@ -24,119 +24,125 @@ class _ServerPageState extends State<ServerPage> {
     super.initState();
     ServerSettings.load().then((s) {
       _url.text = s.url;
-      _key.text = s.key;
       setState(() => _s = s);
     });
   }
 
-  Future<void> _run(Future<void> Function(Api api) job) async {
+  Future<void> _guard(Future<void> Function(Api api) job) async {
     final s = _s!;
-    s.url = _url.text;
-    s.key = _key.text;
     setState(() {
       _busy = true;
       _msg = '';
     });
     try {
+      s.url = _url.text.trim();
       await s.save();
       await job(Api(s));
-    } catch (e) {
-      _msg = 'تعذّر تنفيذ الطلب: تأكد من العنوان والمفتاح والشبكة.\n$e';
+    } on ApiError catch (e) {
+      _msg = e.message;
+      if (e.status == 401 && mounted) {
+        await signOut(context);
+        return;
+      }
+    } catch (_) {
+      _msg = 'تعذّر الاتصال بالخادم، تأكد من العنوان والشبكة.';
     } finally {
       if (mounted) setState(() => _busy = false);
     }
   }
 
-  Future<void> _test() => _run((api) async {
-        _msg = await api.health() ? 'الاتصال ناجح ✅' : 'الخادم لا يستجيب';
-      });
-
-  Future<void> _upload() async {
-    final ok = await showDialog<bool>(
+  Future<bool> _confirm(String title, String text, String yes) async {
+    final r = await showDialog<bool>(
       context: context,
       builder: (c) => AlertDialog(
-        title: const Text('رفع جهات الاتصال'),
-        content: const Text(
-            'سيتم رفع أسماء وأرقام جهات اتصالك إلى الخادم المحدد، وقد تظهر لمن يبحث عن هذه الأرقام. '
-            'يمكنك حذفها لاحقًا من هنا. هل توافق؟'),
+        title: Text(title),
+        content: Text(text),
         actions: [
           TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('إلغاء')),
-          FilledButton(onPressed: () => Navigator.pop(c, true), child: const Text('أوافق وأرفع')),
+          FilledButton(onPressed: () => Navigator.pop(c, true), child: Text(yes)),
         ],
       ),
     );
-    if (ok != true) return;
-    final items = <Map<String, String>>[
-      for (final c in widget.contacts)
-        for (final p in c.phones)
-          if (c.displayName.trim().isNotEmpty)
-            {'name': c.displayName.trim(), 'number': p.number},
-    ];
-    await _run((api) async {
+    return r == true;
+  }
+
+  Future<void> _upload() async {
+    final ok = await _confirm(
+      'رفع جهات الاتصال',
+      'سيتم رفع أسماء وأرقام جهات اتصالك السعودية إلى الخادم، وقد يظهر الاسم لمن يبحث عن الرقم. '
+          'يمكنك حذف بياناتك لاحقًا من هذه الشاشة. هل توافق؟',
+      'أوافق وأرفع',
+    );
+    if (!ok) return;
+    await _guard((api) async {
+      var list = widget.contacts;
+      if (list.isEmpty) {
+        final repo = ContactsRepo();
+        if (!await repo.requestPermission()) {
+          _msg = 'لم يُمنح إذن جهات الاتصال';
+          return;
+        }
+        list = await repo.loadAll();
+      }
+      final items = <Map<String, String>>[
+        for (final c in list)
+          for (final p in c.phones)
+            if (c.displayName.trim().isNotEmpty)
+              {'name': c.displayName.trim(), 'number': p.number},
+      ];
       final n = await api.sync(items);
-      _msg = 'تم رفع $n رقم';
+      _msg = 'تم رفع $n رقم سعودي';
     });
   }
 
-  Future<void> _delete() => _run((api) async {
-        await api.deleteMine();
-        _msg = 'تم حذف بياناتك من الخادم';
-      });
-
-  Future<void> _search() => _run((api) async {
-        _results = await api.search(_q.text.trim());
-        if (_results.isEmpty) _msg = 'لا توجد نتائج';
-      });
+  Future<void> _delete() async {
+    final ok = await _confirm(
+      'حذف الحساب',
+      'سيتم حذف حسابك وجهات الاتصال التي رفعتها وسجل بحثك من الخادم. لا يمكن التراجع.',
+      'احذف',
+    );
+    if (!ok) return;
+    await _guard((api) async {
+      await api.deleteAccount();
+      await _s!.clearSession();
+      if (!mounted) return;
+      await signOut(context);
+    });
+  }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('الخادم')),
+      appBar: AppBar(title: const Text('الحساب والمزامنة')),
       body: _s == null
           ? const Center(child: CircularProgressIndicator())
           : ListView(
               padding: const EdgeInsets.all(16),
               children: [
+                ListTile(
+                  leading: const Icon(Icons.phone_android),
+                  title: Text(_s!.phone, textDirection: TextDirection.ltr, textAlign: TextAlign.right),
+                  subtitle: const Text('الحساب الحالي'),
+                ),
+                const SizedBox(height: 8),
                 TextField(
                   controller: _url,
                   textDirection: TextDirection.ltr,
                   decoration: const InputDecoration(
-                      labelText: 'عنوان الخادم',
-                      hintText: 'http://192.168.1.10:8000',
-                      border: OutlineInputBorder()),
+                      labelText: 'عنوان الخادم', border: OutlineInputBorder()),
                 ),
-                const SizedBox(height: 12),
-                TextField(
-                  controller: _key,
-                  textDirection: TextDirection.ltr,
-                  obscureText: true,
-                  decoration: const InputDecoration(
-                      labelText: 'مفتاح API', border: OutlineInputBorder()),
+                const SizedBox(height: 16),
+                FilledButton(onPressed: _busy ? null : _upload, child: const Text('رفع جهات اتصالي')),
+                const SizedBox(height: 8),
+                OutlinedButton(onPressed: _busy ? null : () => signOut(context), child: const Text('تسجيل الخروج')),
+                const SizedBox(height: 8),
+                OutlinedButton(
+                  onPressed: _busy ? null : _delete,
+                  style: OutlinedButton.styleFrom(foregroundColor: Theme.of(context).colorScheme.error),
+                  child: const Text('حذف حسابي وبياناتي'),
                 ),
-                const SizedBox(height: 12),
-                Wrap(spacing: 8, runSpacing: 8, children: [
-                  FilledButton(onPressed: _busy ? null : _test, child: const Text('حفظ واختبار')),
-                  OutlinedButton(onPressed: _busy ? null : _upload, child: const Text('رفع جهات اتصالي')),
-                  OutlinedButton(onPressed: _busy ? null : _delete, child: const Text('حذف بياناتي')),
-                ]),
                 if (_busy) const Padding(padding: EdgeInsets.all(12), child: LinearProgressIndicator()),
                 if (_msg.isNotEmpty) Padding(padding: const EdgeInsets.all(8), child: Text(_msg)),
-                const Divider(height: 32),
-                TextField(
-                  controller: _q,
-                  onSubmitted: (_) => _search(),
-                  decoration: InputDecoration(
-                    labelText: 'ابحث في الخادم (اسم أو رقم)',
-                    border: const OutlineInputBorder(),
-                    suffixIcon: IconButton(icon: const Icon(Icons.search), onPressed: _busy ? null : _search),
-                  ),
-                ),
-                for (final r in _results)
-                  ListTile(
-                    title: Text('${r['name']}'),
-                    subtitle: Text('${r['number'] ?? ''}', textDirection: TextDirection.ltr, textAlign: TextAlign.right),
-                    trailing: Text('×${r['count']}'),
-                  ),
               ],
             ),
     );
